@@ -475,18 +475,21 @@ class HDF5Writer:
             compression="gzip",
         )
 
-        if prewar is not None:
-            hp, wp = prewar.shape
-            self._d_prewar = self._file.create_dataset(
-                "prewar",
-                shape=(0, hp, wp),
-                maxshape=(None, hp, wp),
-                chunks=(1, hp, wp),
-                dtype=prewar.dtype,
-                compression="gzip",
-            )
-        else:
-            self._d_prewar = None
+        # Always create prewar dataset using canonical tile size
+        global WIDTH, HEIGHT
+        if WIDTH is None:
+            WIDTH = 191
+        if HEIGHT is None:
+            HEIGHT = 224
+
+        self._d_prewar = self._file.create_dataset(
+            "prewar",
+            shape=(0, HEIGHT, WIDTH),
+            maxshape=(None, HEIGHT, WIDTH),
+            chunks=(1, HEIGHT, WIDTH),
+            dtype=np.float32,
+            compression="gzip",
+        )
 
         # metadata: store as variable-length JSON strings
         dt = h5py.special_dtype(vlen=str)
@@ -705,6 +708,11 @@ def scan_grouped_coordinates(
     # If the TIFF is marked COMPLETE, process the entire raster grid (including tiles with no tents)
     grouped = _group_coords(features, step)
 
+    # Ensure tiffs intended for prediction only are always fully processed
+    prediction_only = params.get("processing", {}).get("prediction_only", False)
+    if prediction_only:
+        is_complete = True
+
     if is_complete:
         LOGGER.info(
             f"[{base_name}] marked as COMPLETE - quality gating disabled; scanning entire raster grid."
@@ -748,7 +756,12 @@ def scan_grouped_coordinates(
                     min_valid_fraction=min_valid,
                 )
 
-                if grey is not None and label is not None and meta is not None:
+                if (
+                        grey is not None
+                        and label is not None
+                        and meta is not None
+                        and prewar_tile is not None
+                ):
                     hdf5_writer.add_entry(grey, label, meta, prewar_tile)
                     processed_count += 1
                     high_quality_found = True
@@ -798,7 +811,12 @@ def scan_grouped_coordinates(
             prewar_src,
             min_valid_fraction=min_valid,
         )
-        if grey is not None and label is not None and meta is not None:
+        if (
+                grey is not None
+                and label is not None
+                and meta is not None
+                and prewar_tile is not None
+        ):
             hdf5_writer.add_entry(grey, label, meta, prewar_tile)
             high_quality_found = True
             processed_count += 1
