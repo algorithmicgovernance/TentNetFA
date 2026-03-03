@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from pathlib import Path
 
 import click
 import geopandas as gpd
@@ -137,6 +138,9 @@ def cli(pred_dir: str, val_dir: str, master_grid: str, out_dir: str):
             # --- calculate prediction "error" ---#
             diff = pred_raster - val_raster
 
+            # root mean squared logarithmic error (rmsle)
+            error_raster = np.log1p(pred_raster) - np.log1p(val_raster)
+
             # mask as an array for rasters (outside the mask is False (0))
             mask_array = features.geometry_mask(
                 [prediction_extent_geom],
@@ -150,6 +154,7 @@ def cli(pred_dir: str, val_dir: str, master_grid: str, out_dir: str):
             d_valid = diff[mask_array]
             p_valid = pred_raster[mask_array]
             v_valid = val_raster[mask_array]
+            e_valid = error_raster[mask_array]
 
             # pre-calculate positive cell indices
             valpos_idx = (val_raster > 0) & mask_array
@@ -176,27 +181,29 @@ def cli(pred_dir: str, val_dir: str, master_grid: str, out_dir: str):
                 "total_pdiff": (np.sum(v_valid) - np.sum(p_valid)) / np.sum(v_valid)
                 if np.sum(v_valid) > 0
                 else 0,
-                "bias": np.mean(d_valid),
-                "impr": np.std(d_valid),
-                "inac": np.abs(np.mean(d_valid)),
-                # Validation-positive stats (Omission/Sensitivity focus)
-                "bias_valpos": np.mean(diff_valpos) if diff_valpos.size > 0 else 0,
-                "impr_valpos": np.std(diff_valpos) if diff_valpos.size > 0 else 0,
-                "inac_valpos": np.abs(np.mean(diff_valpos))
-                if diff_valpos.size > 0
-                else 0,
-                # Percent Validation-positive stats
-                "pbias_valpos": np.mean(pdiff_valpos) if pdiff_valpos.size > 0 else 0,
-                "pimpr_valpos": np.std(pdiff_valpos) if pdiff_valpos.size > 0 else 0,
-                "pinac_valpos": np.abs(np.mean(pdiff_valpos))
-                if pdiff_valpos.size > 0
-                else 0,
-                # Prediction-positive stats (Commission/Precision focus)
-                "bias_predpos": np.mean(diff_predpos) if diff_predpos.size > 0 else 0,
-                "impr_predpos": np.std(diff_predpos) if diff_predpos.size > 0 else 0,
-                "inac_predpos": np.abs(np.mean(diff_predpos))
-                if diff_predpos.size > 0
-                else 0,
+                "rmsle": np.sqrt(np.mean(np.square(e_valid))),
+                "exp(rmsle)": np.exp(np.sqrt(np.mean(np.square(e_valid)))),
+                # "bias": np.mean(d_valid),
+                # "impr": np.std(d_valid),
+                # "inac": np.abs(np.mean(d_valid)),
+                # # Validation-positive stats (Omission/Sensitivity focus)
+                # "bias_valpos": np.mean(diff_valpos) if diff_valpos.size > 0 else 0,
+                # "impr_valpos": np.std(diff_valpos) if diff_valpos.size > 0 else 0,
+                # "inac_valpos": np.abs(np.mean(diff_valpos))
+                # if diff_valpos.size > 0
+                # else 0,
+                # # Percent Validation-positive stats
+                # "pbias_valpos": np.mean(pdiff_valpos) if pdiff_valpos.size > 0 else 0,
+                # "pimpr_valpos": np.std(pdiff_valpos) if pdiff_valpos.size > 0 else 0,
+                # "pinac_valpos": np.abs(np.mean(pdiff_valpos))
+                # if pdiff_valpos.size > 0
+                # else 0,
+                # # Prediction-positive stats (Commission/Precision focus)
+                # "bias_predpos": np.mean(diff_predpos) if diff_predpos.size > 0 else 0,
+                # "impr_predpos": np.std(diff_predpos) if diff_predpos.size > 0 else 0,
+                # "inac_predpos": np.abs(np.mean(diff_predpos))
+                # if diff_predpos.size > 0
+                # else 0,
             }
             results_summary.append(stats)
 
@@ -206,7 +213,7 @@ def cli(pred_dir: str, val_dir: str, master_grid: str, out_dir: str):
             nodata_val = -9999.0
 
             # mask all three arrays
-            for r in [pred_raster, val_raster, diff]:
+            for r in [pred_raster, val_raster, diff, error_raster]:
                 r[~mask_array] = nodata_val
 
             # save three rasters (predicted count, validation count, and difference)
@@ -223,10 +230,19 @@ def cli(pred_dir: str, val_dir: str, master_grid: str, out_dir: str):
             )
 
             base_name = os.path.splitext(pred_file)[0]
-            outputs = {"diff": diff, "pred_count": pred_raster, "val_count": val_raster}
+            outputs = {
+                # "diff": diff,
+                "error": error_raster,
+                # "pred_count": pred_raster,
+                # "val_count": val_raster
+            }
 
             for suffix, data in outputs.items():
-                out_path = os.path.join(out_dir, f"{base_name}_{suffix}.tif")
+                out_path = (
+                    Path(out_dir) / f"{suffix}_100m" / f"{base_name}_{suffix}_100m.tif"
+                )
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+
                 with rasterio.open(out_path, "w", **meta) as dest:
                     dest.write(data, 1)
 
@@ -246,8 +262,8 @@ def cli(pred_dir: str, val_dir: str, master_grid: str, out_dir: str):
         click.echo(f"\nSummary report saved to: {summary_path}")
 
         # print overal bias
-        overall_pdiff = df_results["total_pdiff"].mean()
-        click.echo(f"Global Percent Error: {overall_pdiff:.4f}")
+        overall_error = df_results["rmsle"].mean()
+        click.echo(f"Global Mean RMSLE: {overall_error:.4f}")
     else:
         click.echo("No results to summarize.")
 

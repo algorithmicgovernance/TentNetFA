@@ -41,7 +41,7 @@ shapely = "^2.0.7"
 geopandas = "^1.0.1"
 pyproj = "^3.7.0"
 
-[project.scripts]
+[tool.poetry.scripts]
 tif-loader = "scrape_fa.01_tif_loader:tif_loader"
 coordinate-scanner = "scrape_fa.02_coordinate_scanner:cli"
 rebalance-dataset = "scrape_fa.03_rebalance_dataset:cli"
