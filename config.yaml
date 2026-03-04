@@ -20,6 +20,7 @@ loading:
     - al_mawasi_khan_yunis_20241002_115718_ssc7_u0001_visual.tif
     # - gaza_city_and_jabalia_20250319_121502_ssc8_u0001_visual_clip_file_format.tif # TEST SET
 processing:
+  prediction_only: false
   step: 0.0005
   quality_thresholds:
     start_threshold: 0.2

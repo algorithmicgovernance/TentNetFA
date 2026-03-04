@@ -5,6 +5,7 @@ from rasterio.transform import from_bounds
 from rasterio.merge import merge
 from glob import glob
 import numpy as np
+from contextlib import ExitStack
 
 from displacement_tracker.util.logging_config import setup_logging
 
@@ -56,29 +57,28 @@ def merge_prediction_tiffs(tiff_dir, out_path, dst_crs="EPSG:4326"):
         LOGGER.warning("No prediction TIFFs found to merge.")
         return
 
-    src_files = [rasterio.open(p) for p in tiff_paths]
-    # Todo: Can we do better than a hard coded 9 tiles?
-    mosaic, out_trans = merge(src_files, method="sum")  # mosaic shape: (bands, H, W)
-    mosaic = (
-        mosaic / 9
-    )  # renormalize contributions (since we summed 9 tiles for each pixel)
+    with ExitStack() as stack:
+        src_files = [stack.enter_context(rasterio.open(p)) for p in tiff_paths]
 
-    out_meta = src_files[0].meta.copy()
-    out_meta.update(
-        {
-            "driver": "GTiff",
-            "height": mosaic.shape[1],
-            "width": mosaic.shape[2],
-            "transform": out_trans,
-            "crs": dst_crs,
-            "count": mosaic.shape[0],
-            "dtype": mosaic.dtype,
-        }
-    )
+        # Todo: Can we do better than a hard coded 9 tiles?
+        mosaic, out_trans = merge(src_files, method="sum")
+        mosaic = mosaic / 9
+        mosaic = mosaic.astype(np.float32)
 
-    with rasterio.open(out_path, "w", **out_meta) as dest:
-        dest.write(mosaic)
+        out_meta = src_files[0].meta.copy()
+        out_meta.update(
+            {
+                "driver": "GTiff",
+                "height": mosaic.shape[1],
+                "width": mosaic.shape[2],
+                "transform": out_trans,
+                "crs": dst_crs,
+                "count": mosaic.shape[0],
+                "dtype": "float32",
+            }
+        )
 
-    for src in src_files:
-        src.close()
+        with rasterio.open(out_path, "w", **out_meta) as dest:
+            dest.write(mosaic)
+
     LOGGER.info(f"Mosaic written to {out_path}")
