@@ -1,0 +1,2 @@
+region_total_error_estimate,region_total_error_ci_lo,region_total_error_ci_hi,region_mean_error_estimate,region_mean_error_ci_lo,region_mean_error_ci_hi,n_hex_blocks,n_tiles_used
+-2016.0,-2876.125,-1241.9500000000003,-1.6153846153846154,-2.3045873397435894,-0.9951522435897439,473,1248
