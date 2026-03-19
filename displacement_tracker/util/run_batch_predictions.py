@@ -31,7 +31,7 @@ def main(config_path):
         raise FileNotFoundError(f"GeoTIFF directory not found: {tif_dir}")
 
     pred_cfg = base_params["prediction"]
-    processing_cfg = pred_cfg.get("processing", {})
+    selection_cfg = pred_cfg.get("selection", {})
     sample_cfg = pred_cfg.get("sample", {})
     device_name = pred_cfg.get("device", None)
 
@@ -93,7 +93,7 @@ def main(config_path):
             ds,
             model,
             device,
-            processing_cfg,
+            selection_cfg,
             sample_cfg,
             validation_tifs=params["prediction"].get("validation_tifs", False),
         )

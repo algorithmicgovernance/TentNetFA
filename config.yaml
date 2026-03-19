@@ -1,7 +1,7 @@
-geotiff_dir: tiff_files
+geotiff_dir: /data/projects/gazatents/results_karim/2026-02/tiffs
 boundaries: gaza_boundaries/GazaStrip_MunicipalBoundaries.shp
-prewar_gaza: tiff_files/prewar_gaza.tif
-geojson: tiff_files/snapshot-tents-2025-12-03_121923.geojson
+prewar_gaza: /data/project/gazatents/data/prewar_gaza.tif
+geojson: /data/projects/gazatents/results_karim/2026-02
 hdf5: train_data_labelling_balanced.h5
 artifact_dir: runs
 loading:
@@ -38,7 +38,7 @@ rebalancing:
   out: "train_data_labelling_balanced.h5"
   rng_seed: 42
 training:
-  checkpoint: null # runs/20251215_104659/best_model.pth # runs/20251215_033219/best_model.pth
+  checkpoint: v1.0.pth
   device: cuda
   epochs: 10000
   batch_size: 32

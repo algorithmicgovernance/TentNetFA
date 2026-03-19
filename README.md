@@ -90,11 +90,13 @@ The CLI requires a YAML configuration file with the following structure:
 geotiff_dir: <directory to safe geotiffs to>
 geojson: <tent geojson file from web platform>
 hdf5: <storage location of the HDF5 dataset>
+hdf5_folder: <folder for per-TIFF HDF5 files when processing.individual is true>
 artifact_dir: <location of training run outputs>
 loading:
   files:
     <List of tiff files for processing>
 processing:
+  individual: false # when true, ignore hdf5 and write one HDF5 per TIFF into hdf5_folder
   step: 0.0005 # step size for each tile in degress lat and long
   quality_thresholds:
     start_threshold: 0.2  # fraction of tents with same day start date
@@ -112,7 +114,7 @@ training:
 ## Output
 
 - **GeoTIFFs:** Downloaded to the directory specified in `geotiff_dir`.
-- **HDF5 Dataset:** Contains two groups: `features` (greyscale images) and `labels` (masks). Each entry is a dataset with attributes: `origin_image`, `origin_date`, `min_lat`, `max_lat`, `min_lon`, `max_lon`.
+- **HDF5 Dataset:** By default the scanner appends all selected TIFFs into the single path in `hdf5`. If `processing.individual` is `true`, it instead writes one HDF5 per TIFF into `hdf5_folder`, reusing the TIFF basename and using the configured HDF5 suffix.
 - **Model Checkpoints & Logs:** Saved during training (see `runs/` and log files).
 - **Predictions:** If generated, are saved as hdf5 files in the `runs/` directory, same structure as HDF5 ds.
 

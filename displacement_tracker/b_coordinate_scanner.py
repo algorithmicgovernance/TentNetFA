@@ -191,6 +191,170 @@ def _read_rgb_and_grey(src: rasterio.io.DatasetReader, window):
     return grey
 
 
+def _compute_greyscale_stats(
+    src: rasterio.io.DatasetReader,
+) -> tuple[float, float, str] | None:
+    """Compute grayscale mean/std; uses metadata when exact stats are available."""
+    # Fast path: exact single-band statistics from metadata tags.
+    try:
+        if src.count == 1:
+            tags = src.tags(1)
+            if "STATISTICS_MEAN" in tags and "STATISTICS_STDDEV" in tags:
+                return (
+                    float(tags["STATISTICS_MEAN"]),
+                    float(tags["STATISTICS_STDDEV"]),
+                    "metadata",
+                )
+    except Exception:
+        pass
+
+    # Fallback path: stream over raster blocks (does not load full image into memory).
+    sum_grey = 0.0
+    sum_sq_grey = 0.0
+    count = 0
+
+    try:
+        nodata = src.nodata
+        band_indexes = [1, 2, 3] if src.count >= 3 else [1]
+        for _, window in src.block_windows(band_indexes[0]):
+            data = src.read(band_indexes, window=window)
+            if data.size == 0:
+                continue
+
+            if src.count >= 3:
+                r = data[0].astype(np.float32)
+                g = data[1].astype(np.float32)
+                b = data[2].astype(np.float32)
+                grey = 0.2989 * r + 0.5870 * g + 0.1140 * b
+            else:
+                grey = data[0].astype(np.float32)
+
+            valid_mask = np.isfinite(grey)
+            if nodata is not None:
+                if src.count >= 3:
+                    valid_mask &= (r != nodata) & (g != nodata) & (b != nodata)
+                else:
+                    valid_mask &= grey != nodata
+
+            if not np.any(valid_mask):
+                continue
+
+            valid_vals = grey[valid_mask]
+            sum_grey += float(valid_vals.sum(dtype=np.float64))
+            sum_sq_grey += float(
+                np.square(valid_vals, dtype=np.float64).sum(dtype=np.float64)
+            )
+            count += int(valid_vals.size)
+
+        if count == 0:
+            return None
+
+        mean = sum_grey / count
+        variance = max(0.0, (sum_sq_grey / count) - (mean * mean))
+        std = math.sqrt(variance)
+        return (mean, std, "block-scan")
+    except Exception:
+        return None
+
+
+def _log_greyscale_stats(src: rasterio.io.DatasetReader, tif_name: str) -> tuple[float, float] | None:
+    """Log grayscale mean/std and return them."""
+    stats = _compute_greyscale_stats(src)
+    if stats is None:
+        LOGGER.warning("[%s] No valid grayscale pixels found for statistics.", tif_name)
+        return None
+
+    mean, std, source = stats
+    LOGGER.info(
+        "[%s] grayscale stats (%s): mean=%.3f, std=%.3f",
+        tif_name,
+        source,
+        mean,
+        std,
+    )
+    return (mean, std)
+
+
+def _resolve_normalize_params(
+    normalize_cfg: dict[str, Any] | None,
+    current_stats: tuple[float, float] | None,
+    tif_name: str,
+) -> dict[str, float] | None:
+    """Resolve per-TIFF normalization parameters from config and measured stats."""
+    if not isinstance(normalize_cfg, dict):
+        return None
+
+    if "enable" in normalize_cfg:
+        enabled = bool(normalize_cfg.get("enable", False))
+
+    if not enabled:
+        return None
+
+    target_mean = normalize_cfg.get("mean")
+    target_std = normalize_cfg.get("std")
+    if target_mean is None or target_std is None:
+        LOGGER.warning(
+            "[%s] normalization enabled but processing.normalize.mean/std missing; skipping normalization.",
+            tif_name,
+        )
+        return None
+
+    if current_stats is None:
+        LOGGER.warning(
+            "[%s] normalization enabled but source grayscale stats are unavailable; skipping normalization.",
+            tif_name,
+        )
+        return None
+
+    src_mean, src_std = current_stats
+    src_std = float(src_std)
+    if src_std <= 1e-8:
+        LOGGER.warning(
+            "[%s] source grayscale std is near zero (%.6f); skipping normalization.",
+            tif_name,
+            src_std,
+        )
+        return None
+
+    params = {
+        "source_mean": float(src_mean),
+        "source_std": src_std,
+        "target_mean": float(target_mean),
+        "target_std": float(target_std),
+    }
+    LOGGER.info(
+        "[%s] normalization enabled: source mean/std=(%.3f, %.3f) -> target mean/std=(%.3f, %.3f)",
+        tif_name,
+        params["source_mean"],
+        params["source_std"],
+        params["target_mean"],
+        params["target_std"],
+    )
+    return params
+
+
+def _apply_greyscale_normalization(
+    grey: np.ndarray,
+    normalize_params: dict[str, float] | None,
+) -> np.ndarray:
+    """Linearly rescale grayscale tile to target mean/std when enabled."""
+    if not normalize_params:
+        return grey
+
+    src_mean = normalize_params["source_mean"]
+    src_std = normalize_params["source_std"]
+    target_mean = normalize_params["target_mean"]
+    target_std = normalize_params["target_std"]
+
+    scale = target_std / src_std
+    normalized = grey.astype(np.float32, copy=True)
+    finite_mask = np.isfinite(normalized)
+    normalized[finite_mask] = (
+        (normalized[finite_mask] - src_mean) * scale + target_mean
+    )
+    return normalized
+
+
 def _create_label_from_feats(
     lon_min: float,
     lat_min: float,
@@ -234,6 +398,7 @@ def process_group(
     wgs84_crs: Any,
     prewar_src: rasterio.io.DatasetReader | None = None,
     min_valid_fraction: float = 0.0,  # << added param
+    normalize_params: dict[str, float] | None = None,
 ) -> tuple[
     np.ndarray | None, np.ndarray | None, dict[str, Any] | None, np.ndarray | None
 ]:
@@ -268,6 +433,8 @@ def process_group(
                 min_valid_fraction,
             )
             return None, None, None, None
+
+        grey = _apply_greyscale_normalization(grey, normalize_params)
 
         # window is (r0,r1,c0,c1) with r1/c1 exclusive-like indices from _world_window
         r0, r1, c0, c1 = window
@@ -657,6 +824,8 @@ def scan_grouped_coordinates(
     prewar_path: str | None = None,
     boundaries_path: str | None = None,
     complete_list: list[str] | None = None,
+    prediction_only: bool = False,
+    normalize_cfg: dict[str, Any] | None = None,
 ) -> None:
     src = _open_raster(geotiff_path)
     if src is None:
@@ -667,6 +836,12 @@ def scan_grouped_coordinates(
         if cropped is None:
             return
         src = cropped
+
+    tif_name = os.path.basename(geotiff_path)
+    current_stats = _log_greyscale_stats(src, tif_name)
+    normalize_params = _resolve_normalize_params(
+        normalize_cfg, current_stats, tif_name
+    )
 
     prewar_src = _open_raster(prewar_path) if prewar_path else None
 
@@ -709,7 +884,6 @@ def scan_grouped_coordinates(
     grouped = _group_coords(features, step)
 
     # Ensure tiffs intended for prediction only are always fully processed
-    prediction_only = params.get("processing", {}).get("prediction_only", False)
     if prediction_only:
         is_complete = True
 
@@ -754,6 +928,7 @@ def scan_grouped_coordinates(
                     "EPSG:4326",
                     prewar_src,
                     min_valid_fraction=min_valid,
+                    normalize_params=normalize_params,
                 )
 
                 if (
@@ -810,6 +985,7 @@ def scan_grouped_coordinates(
             "EPSG:4326",
             prewar_src,
             min_valid_fraction=min_valid,
+            normalize_params=normalize_params,
         )
         if (
                 grey is not None
@@ -837,10 +1013,18 @@ def scan_all_coordinates(
     step: float = 0.001,
     prewar_path: str | None = None,
     min_valid_fraction: float = 0.0,
+    normalize_cfg: dict[str, Any] | None = None,
 ):
+    LOGGER.info(f"Scanning entire raster grid for {os.path.basename(geotiff_path)} with step {step} and min_valid_fraction {min_valid_fraction}")
     src = _open_raster(geotiff_path)
     if src is None:
         return
+
+    tif_name = os.path.basename(geotiff_path)
+    current_stats = _log_greyscale_stats(src, tif_name)
+    normalize_params = _resolve_normalize_params(
+        normalize_cfg, current_stats, tif_name
+    )
 
     bounds = src.bounds
     lon_bounds, lat_bounds = transform(
@@ -868,6 +1052,7 @@ def scan_all_coordinates(
                 "EPSG:4326",
                 prewar_src,
                 min_valid_fraction=min_valid_fraction,
+                normalize_params=normalize_params,
             )
             if grey is not None and label is not None and meta is not None:
                 hdf5_writer.add_entry(grey, label, meta, prewar_img)
@@ -877,12 +1062,87 @@ def scan_all_coordinates(
         prewar_src.close()
 
 
+def _collect_tif_files(geotiff_dir: str, config: str | None = None) -> list[str]:
+    if config:
+        with open(config, "r") as f:
+            cfg = yaml.safe_load(f)
+        search_files = cfg.get("loading", {}).get("files", [])
+        return [
+            os.path.join(geotiff_dir, file_name)
+            for file_name in search_files
+            if os.path.exists(os.path.join(geotiff_dir, file_name))
+        ]
+    return glob.glob(os.path.join(geotiff_dir, "*.tif"))
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _hdf5_suffix(hdf5: str | None) -> str:
+    if not hdf5:
+        return ".hdf5"
+    suffix = os.path.splitext(hdf5)[1]
+    return suffix or ".hdf5"
+
+
+def _scan_tif_to_writer(
+    tif_path: str,
+    geojson: str | None,
+    writer: HDF5Writer,
+    quality_thresholds: dict[str, Any],
+    step: float,
+    prewar_path: str | None,
+    boundaries_path: str | None,
+    complete_list: list[str],
+    prediction_only: bool,
+    normalize_cfg: dict[str, Any] | None,
+) -> bool:
+    date_target = _extract_date_from_filename(tif_path)
+    if not date_target:
+        LOGGER.warning(f"Skipping {tif_path} (no date found in filename).")
+        return False
+
+    if geojson:
+        scan_grouped_coordinates(
+            tif_path,
+            geojson,
+            writer,
+            quality_thresholds,
+            step,
+            date_target,
+            prewar_path,
+            boundaries_path,
+            complete_list,
+            prediction_only=prediction_only,
+            normalize_cfg=normalize_cfg,
+        )
+    else:
+        min_valid_fraction = (
+            quality_thresholds.get("min_valid_fraction", 0.0)
+            if isinstance(quality_thresholds, dict)
+            else 0.0
+        )
+        scan_all_coordinates(
+            tif_path,
+            writer,
+            date_target,
+            step,
+            prewar_path,
+            min_valid_fraction=min_valid_fraction,
+            normalize_cfg=normalize_cfg,
+        )
+    return True
+
+
 @click.command()
 @click.argument("config", type=click.Path(exists=True, dir_okay=False))
 def cli(config):
     with open(config, "r") as f:
         params = yaml.safe_load(f)
-    for key in ("geotiff_dir", "hdf5", "processing"):
+    for key in ("geotiff_dir", "processing"):
         if key not in params:
             raise click.ClickException(f"Missing required config key: {key}")
 
@@ -890,78 +1150,111 @@ def cli(config):
     step = proc["step"]
     quality_thresholds = proc["quality_thresholds"]
     complete_list = proc.get("complete", [])  # exact filenames listed in YAML
+    individual = bool(proc.get("individual", False))
+
+    if individual and not params.get("hdf5_folder"):
+        raise click.ClickException(
+            "Missing required config key: hdf5_folder when processing.individual is true"
+        )
+    if not individual and "hdf5" not in params:
+        raise click.ClickException("Missing required config key: hdf5")
 
     coordinate_scanner(
         params["geotiff_dir"],
         params.get("geojson"),
-        params["hdf5"],
+        params.get("hdf5"),
         step,
         quality_thresholds,
         prewar_path=params.get("prewar_gaza"),
         boundaries_path=params.get("boundaries"),
         complete_list=complete_list,
+        prediction_only=bool(proc.get("prediction_only", False)),
+        individual=individual,
+        hdf5_folder=params.get("hdf5_folder"),
         config=config,
+        normalize_cfg=proc.get("normalize"),
     )
 
 
 def coordinate_scanner(
     geotiff_dir: str,
     geojson: str | None,
-    hdf5: str,
+    hdf5: str | None,
     step: float,
     quality_thresholds: dict[str, Any],
     prewar_path: str | None = None,
     boundaries_path: str | None = None,
     complete_list: list[str] | None = None,
+    prediction_only: bool = False,
+    individual: bool = False,
+    hdf5_folder: str | None = None,
     config: str | None = None,
+    normalize_cfg: dict[str, Any] | None = None,
 ) -> None:
-    if config:
-        with open(config, "r") as f:
-            cfg = yaml.safe_load(f)
-        search_files = cfg.get("loading", {}).get("files", [])
-        tif_files = [
-            os.path.join(geotiff_dir, f)
-            for f in search_files
-            if os.path.exists(os.path.join(geotiff_dir, f))
-        ]
-    else:
-        tif_files = glob.glob(os.path.join(geotiff_dir, "*.tif"))
+    tif_files = _collect_tif_files(geotiff_dir, config)
 
     if not tif_files:
         LOGGER.error(f"No .tif files found in {geotiff_dir}")
         return
 
     with rasterio.Env(GDAL_CACHEMAX=256):
-        for tif_path in tif_files:
-            date_target = _extract_date_from_filename(tif_path)
-            if not date_target:
-                LOGGER.warning(f"Skipping {tif_path} (no date found in filename).")
-                continue
+        if individual:
+            if not hdf5_folder:
+                raise ValueError(
+                    "hdf5_folder must be provided when processing individual TIFF outputs"
+                )
 
-            base = os.path.splitext(os.path.basename(tif_path))[0]
-            out_h5 = os.path.join(os.path.dirname(hdf5), f"{base}.h5")
+            os.makedirs(hdf5_folder, exist_ok=True)
+            suffix = _hdf5_suffix(hdf5)
 
-            LOGGER.info(f"Processing {tif_path} → {out_h5}")
+            for tif_path in tif_files:
+                base = os.path.splitext(os.path.basename(tif_path))[0]
+                out_h5 = os.path.join(hdf5_folder, f"{base}{suffix}")
+                _ensure_parent_dir(out_h5)
 
-            writer = HDF5Writer(out_h5)
+                LOGGER.info(f"Processing {tif_path} → {out_h5}")
+                writer = HDF5Writer(out_h5)
+                try:
+                    _scan_tif_to_writer(
+                        tif_path,
+                        geojson,
+                        writer,
+                        quality_thresholds,
+                        step,
+                        prewar_path,
+                        boundaries_path,
+                        complete_list or [],
+                        prediction_only,
+                        normalize_cfg,
+                    )
+                finally:
+                    writer.write()
+                LOGGER.info(f"Saved dataset to {out_h5}")
+            return
 
-            if geojson:
-                scan_grouped_coordinates(
+        if not hdf5:
+            raise ValueError("hdf5 must be provided when processing.individual is false")
+
+        _ensure_parent_dir(hdf5)
+        LOGGER.info(f"Processing {len(tif_files)} TIFF files into {hdf5}")
+        writer = HDF5Writer(hdf5)
+        try:
+            for tif_path in tif_files:
+                _scan_tif_to_writer(
                     tif_path,
                     geojson,
                     writer,
                     quality_thresholds,
                     step,
-                    date_target,
                     prewar_path,
                     boundaries_path,
                     complete_list or [],
+                    prediction_only,
+                    normalize_cfg,
                 )
-            else:
-                scan_all_coordinates(tif_path, writer, date_target, step, prewar_path)
-
+        finally:
             writer.write()
-            LOGGER.info(f"Saved dataset to {out_h5}")
+        LOGGER.info(f"Saved dataset to {hdf5}")
 
 
 if __name__ == "__main__":
